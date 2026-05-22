@@ -1,0 +1,918 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distance to Jules</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="ambient-gradient" aria-hidden="true"></div>
+
+  <main class="experience-shell">
+    <section class="view-window" id="view-window" aria-label="A cherry blossom over Shanghai">
+      <canvas class="pixel-scene" id="pixel-scene" aria-hidden="true"></canvas>
+    </section>
+  </main>
+
+  <header class="top-bar">
+    <p class="brand">Distance to Jules</p>
+    <button id="audio-toggle" class="audio-toggle" type="button" aria-pressed="false" aria-label="Toggle ambient sound">
+      <span class="audio-toggle__label">Sound on</span>
+    </button>
+  </header>
+
+  <div class="curtains" id="curtains">
+    <div class="curtain curtain--left" aria-hidden="true"></div>
+    <div class="curtain curtain--right" aria-hidden="true"></div>
+    <button class="curtain-open" id="curtain-open" type="button">
+      <span class="curtain-open__main">Open the curtains</span>
+    </button>
+  </div>
+
+  <script>
+    const viewWindow = document.getElementById("view-window");
+    const pixelCanvas = document.getElementById("pixel-scene");
+    const audioToggle = document.getElementById("audio-toggle");
+    const audioToggleLabel = audioToggle.querySelector(".audio-toggle__label");
+    const curtains = document.getElementById("curtains");
+    const curtainOpen = document.getElementById("curtain-open");
+
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const scenePalette = { bgA: "#0d0a22", bgB: "#3a1f3a", accent: "#ffd9b3", glow: "#ff9e7a" };
+    const blossomPinks = ["#ff9ec6", "#ffd0e4", "#ff7fb0"];
+    const cityColors = ["#ffd27a", "#ff7fb0", "#74e0ff", "#b98cff", "#ff9b6f", "#86ffcf"];
+
+    // ===== Audio: real classical track if present, expressive synth fallback otherwise =====
+    // Drop a royalty-free / public-domain piano or strings piece here to use a real recording:
+    const musicUrl = "./assets/audio/music.mp3";
+    const targetVolume = 0.55; // synth master target
+    const fileVolume = 0.85;   // audio-file target volume
+
+    let isMuted = false;
+    let audioStarted = false;
+
+    // Audio-file playback
+    let musicEl = null;
+    let musicFailed = false;
+    let usingFile = false;
+    let musicFadeId = null;
+
+    // Synth fallback state
+    let audioCtx = null;
+    let masterGain = null;
+    let padGain = null;
+    let pluckBus = null;
+    let padOscs = [];
+    let synthReady = false;
+    let beat = 0;
+    let chordIndex = 0;
+    let nextNoteTime = 0;
+    let schedulerId = null;
+
+    // A-minor romantic progression: Am - F - C - E (i - VI - III - V), each chord [low, mid, high]
+    const progression = [
+      [220.0, 261.63, 329.63],
+      [174.61, 220.0, 261.63],
+      [261.63, 329.63, 392.0],
+      [164.81, 207.65, 246.94]
+    ];
+
+    function setupMusic() {
+      musicEl = new Audio(musicUrl);
+      musicEl.loop = true;
+      musicEl.preload = "auto";
+      musicEl.volume = 0;
+      musicEl.addEventListener("error", () => { musicFailed = true; });
+    }
+
+    function fadeMusic(target) {
+      if (!musicEl) return;
+      if (musicFadeId) clearInterval(musicFadeId);
+      const step = (target - musicEl.volume) / 40;
+      musicFadeId = window.setInterval(() => {
+        let v = musicEl.volume + step;
+        if ((step >= 0 && v >= target) || (step < 0 && v <= target)) {
+          v = target;
+          clearInterval(musicFadeId);
+          musicFadeId = null;
+        }
+        musicEl.volume = Math.min(1, Math.max(0, v));
+      }, 50);
+    }
+
+    function fadeMaster(value) {
+      if (!audioCtx || !masterGain) return;
+      const now = audioCtx.currentTime;
+      masterGain.gain.cancelScheduledValues(now);
+      masterGain.gain.setValueAtTime(Math.max(masterGain.gain.value, 0.0001), now);
+      masterGain.gain.exponentialRampToValueAtTime(Math.max(value, 0.0001), now + 1.8);
+    }
+
+    function startSynth() {
+      if (synthReady) {
+        if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+        return;
+      }
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      synthReady = true;
+      audioCtx = new AudioContextClass();
+
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.0001;
+      const masterLP = audioCtx.createBiquadFilter();
+      masterLP.type = "lowpass";
+      masterLP.frequency.value = 2600;
+      masterGain.connect(masterLP);
+      masterLP.connect(audioCtx.destination);
+
+      padGain = audioCtx.createGain();
+      padGain.gain.value = 0.05;
+      padGain.connect(masterGain);
+      const padFilter = audioCtx.createBiquadFilter();
+      padFilter.type = "lowpass";
+      padFilter.frequency.value = 600;
+      padFilter.connect(padGain);
+      padOscs = progression[0].map((f) => {
+        const osc = audioCtx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.value = f / 2;
+        const g = audioCtx.createGain();
+        g.gain.value = 0.4;
+        osc.connect(g).connect(padFilter);
+        osc.start();
+        return osc;
+      });
+      const padLfo = audioCtx.createOscillator();
+      const padLfoGain = audioCtx.createGain();
+      padLfo.frequency.value = 0.05;
+      padLfoGain.gain.value = 180;
+      padLfo.connect(padLfoGain).connect(padFilter.frequency);
+      padLfo.start();
+
+      pluckBus = audioCtx.createGain();
+      pluckBus.gain.value = 0.9;
+      pluckBus.connect(masterGain);
+      const delay = audioCtx.createDelay(1.0);
+      delay.delayTime.value = 0.4;
+      const feedback = audioCtx.createGain();
+      feedback.gain.value = 0.38;
+      const wet = audioCtx.createGain();
+      wet.gain.value = 0.5;
+      const delayLP = audioCtx.createBiquadFilter();
+      delayLP.type = "lowpass";
+      delayLP.frequency.value = 1800;
+      pluckBus.connect(delay);
+      delay.connect(delayLP);
+      delayLP.connect(wet);
+      wet.connect(masterGain);
+      delayLP.connect(feedback);
+      feedback.connect(delay);
+
+      beat = 0;
+      chordIndex = 0;
+      if (!isMuted) fadeMaster(targetVolume);
+      startScheduler();
+    }
+
+    function setPadChord(chord, time) {
+      padOscs.forEach((osc, i) => {
+        const f = chord[i % chord.length] / 2;
+        osc.frequency.cancelScheduledValues(time);
+        osc.frequency.setValueAtTime(osc.frequency.value, time);
+        osc.frequency.linearRampToValueAtTime(f, time + 0.5);
+      });
+    }
+
+    function playPluck(freq, time, velocity) {
+      const osc = audioCtx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const shimmer = audioCtx.createOscillator();
+      shimmer.type = "sine";
+      shimmer.frequency.value = freq * 2;
+
+      const env = audioCtx.createGain();
+      env.gain.setValueAtTime(0.0001, time);
+      env.gain.linearRampToValueAtTime(velocity, time + 0.02);
+      env.gain.exponentialRampToValueAtTime(0.0001, time + 2.8);
+
+      const shimmerGain = audioCtx.createGain();
+      shimmerGain.gain.value = 0.18;
+
+      osc.connect(env);
+      shimmer.connect(shimmerGain).connect(env);
+      env.connect(pluckBus);
+
+      osc.start(time);
+      shimmer.start(time);
+      osc.stop(time + 2.9);
+      shimmer.stop(time + 2.9);
+    }
+
+    function scheduler() {
+      if (!audioCtx) return;
+      while (nextNoteTime < audioCtx.currentTime + 0.25) {
+        if (audioCtx.state === "running" && !isMuted) {
+          const chord = progression[chordIndex];
+          if (beat % 4 === 0) setPadChord(chord, nextNoteTime);
+          playPluck(chord[beat % chord.length], nextNoteTime, 0.08);
+          if (Math.random() < 0.55) {
+            const mel = chord[Math.floor(Math.random() * chord.length)] * 2;
+            playPluck(mel, nextNoteTime + 0.2, 0.06);
+          }
+          beat += 1;
+          if (beat % 4 === 0) chordIndex = (chordIndex + 1) % progression.length;
+        }
+        nextNoteTime += 1.1;
+      }
+    }
+
+    function startScheduler() {
+      if (schedulerId || !audioCtx) return;
+      nextNoteTime = audioCtx.currentTime + 0.2;
+      schedulerId = window.setInterval(scheduler, 60);
+    }
+
+    function stopScheduler() {
+      if (schedulerId) {
+        clearInterval(schedulerId);
+        schedulerId = null;
+      }
+    }
+
+    function startAudio() {
+      if (audioStarted) return;
+      audioStarted = true;
+      if (!musicFailed && musicEl) {
+        const playPromise = musicEl.play();
+        if (playPromise && playPromise.then) {
+          playPromise
+            .then(() => {
+              usingFile = true;
+              if (!isMuted) fadeMusic(fileVolume);
+            })
+            .catch(() => {
+              usingFile = false;
+              startSynth();
+            });
+        }
+      } else {
+        startSynth();
+      }
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      if (usingFile) {
+        if (isMuted) {
+          fadeMusic(0);
+        } else {
+          if (musicEl.paused) musicEl.play().catch(() => {});
+          fadeMusic(fileVolume);
+        }
+      } else {
+        if (!synthReady) startSynth();
+        else if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+        fadeMaster(isMuted ? 0.0001 : targetVolume);
+      }
+      audioToggle.setAttribute("aria-pressed", String(isMuted));
+      audioToggle.classList.toggle("is-muted", isMuted);
+      audioToggleLabel.textContent = isMuted ? "Sound off" : "Sound on";
+    }
+
+    // ===== Pixel-art vista =====
+    const pctx = pixelCanvas.getContext("2d");
+    const PIXEL_SCALE = 5;
+    let pw = 0;
+    let ph = 0;
+    let lookX = 0;
+    let lookY = 0;
+    let petals = [];
+    let buildings = [];
+    let stars = [];
+    let shootingStars = [];
+    let nextStarTime = 0;
+    let animClock = 0;
+    let rafId = null;
+    let lastTs = 0;
+    let resizeRaf = null;
+
+    function hexToRgb(hex) {
+      const h = hex.replace("#", "");
+      return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
+    }
+
+    function mixHex(a, b, t) {
+      const ca = hexToRgb(a);
+      const cb = hexToRgb(b);
+      const r = Math.round(ca[0] + (cb[0] - ca[0]) * t);
+      const g = Math.round(ca[1] + (cb[1] - ca[1]) * t);
+      const bl = Math.round(ca[2] + (cb[2] - ca[2]) * t);
+      return "rgb(" + r + ", " + g + ", " + bl + ")";
+    }
+
+    function shade(hex, amt) {
+      const c = hexToRgb(hex);
+      const adjust = (v) => (amt < 0 ? Math.round(v * (1 + amt)) : Math.round(v + (255 - v) * amt));
+      return "rgb(" + adjust(c[0]) + ", " + adjust(c[1]) + ", " + adjust(c[2]) + ")";
+    }
+
+    function hashFrac(x, y) {
+      const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+      return s - Math.floor(s);
+    }
+
+    function rect(x, y, w, h, color) {
+      pctx.fillStyle = color;
+      pctx.fillRect(Math.round(x), Math.round(y), Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
+    }
+
+    function drawDisc(cx, cy, r, color, alpha) {
+      pctx.globalAlpha = alpha;
+      pctx.fillStyle = color;
+      const r2 = r * r;
+      for (let y = -Math.ceil(r); y <= Math.ceil(r); y += 1) {
+        const dx = Math.floor(Math.sqrt(Math.max(0, r2 - y * y)));
+        pctx.fillRect(Math.round(cx - dx), Math.round(cy + y), dx * 2 + 1, 1);
+      }
+      pctx.globalAlpha = 1;
+    }
+
+    function drawThickLine(x0, y0, x1, y1, thick, color) {
+      const steps = Math.max(1, Math.round(Math.hypot(x1 - x0, y1 - y0)));
+      for (let s = 0; s <= steps; s += 1) {
+        const t = s / steps;
+        rect(x0 + (x1 - x0) * t - thick / 2, y0 + (y1 - y0) * t - thick / 2, thick, thick, color);
+      }
+    }
+
+    function horizonY() {
+      return Math.round(ph * 0.64);
+    }
+
+    function spawnPetal(scatter) {
+      return {
+        x: Math.random() * pw,
+        y: scatter ? Math.random() * ph : -3,
+        vy: 5 + Math.random() * 9,
+        vx: -6 + Math.random() * 12,
+        sway: Math.random() * Math.PI * 2,
+        swaySpeed: 0.8 + Math.random() * 1.6,
+        swayAmp: 4 + Math.random() * 8,
+        size: 1.6 + Math.random() * 1.6,
+        tint: Math.floor(Math.random() * blossomPinks.length)
+      };
+    }
+
+    function seedPetals() {
+      petals = [];
+      const count = Math.round(pw * 0.12);
+      for (let i = 0; i < count; i += 1) petals.push(spawnPetal(true));
+    }
+
+    function buildStars() {
+      stars = [];
+      const count = Math.round(pw * 0.18);
+      for (let i = 0; i < count; i += 1) {
+        stars.push({
+          x: Math.floor(Math.random() * pw),
+          y: Math.floor(Math.random() * (ph * 0.45)),
+          phase: Math.random() * Math.PI * 2,
+          speed: 0.6 + Math.random() * 1.4
+        });
+      }
+    }
+
+    function buildSkyline() {
+      buildings = [];
+      const horizon = horizonY();
+      const cityX0 = Math.round(pw * 0.34);
+      let x = cityX0;
+      while (x < pw - 2) {
+        const w = 3 + Math.floor(Math.random() * 5);
+        const h = Math.round(horizon * 0.2 + Math.random() * (horizon * 0.4));
+        const baseColor = cityColors[Math.floor(Math.random() * cityColors.length)];
+        const windows = [];
+        for (let wy = horizon - h + 2; wy < horizon - 2; wy += 3) {
+          for (let wx = x + 1; wx < x + w - 1; wx += 2) {
+            const color = Math.random() < 0.78 ? baseColor : cityColors[Math.floor(Math.random() * cityColors.length)];
+            windows.push({ x: wx, y: wy, phase: Math.random() * Math.PI * 2, base: 0.3 + Math.random() * 0.6, color });
+          }
+        }
+        buildings.push({ x, w, h, windows });
+        x += w + 1;
+      }
+    }
+
+    function setupPixelScene() {
+      const r = pixelCanvas.getBoundingClientRect();
+      pw = Math.max(180, Math.round(r.width / PIXEL_SCALE));
+      ph = Math.max(120, Math.round(r.height / PIXEL_SCALE));
+      pixelCanvas.width = pw;
+      pixelCanvas.height = ph;
+      pctx.imageSmoothingEnabled = false;
+      buildSkyline();
+      buildStars();
+      seedPetals();
+      shootingStars = [];
+      nextStarTime = 3 + Math.random() * 5;
+    }
+
+    function drawSky() {
+      const horizon = horizonY();
+      for (let y = 0; y < ph; y += 1) {
+        const t = Math.min(1, y / horizon);
+        pctx.fillStyle = mixHex(scenePalette.bgA, scenePalette.bgB, t);
+        pctx.fillRect(0, y, pw, 1);
+      }
+    }
+
+    function drawStars() {
+      for (const s of stars) {
+        const tw = 0.5 + 0.5 * Math.sin(animClock * s.speed + s.phase);
+        pctx.globalAlpha = 0.4 * tw;
+        rect(s.x, s.y, 1, 1, shade(scenePalette.accent, 0.5));
+      }
+      pctx.globalAlpha = 1;
+    }
+
+    function drawCelestial() {
+      const cx = pw * 0.86;
+      const cy = ph * 0.16;
+      const r = pw * 0.045;
+      drawDisc(cx, cy, r * 1.7, shade(scenePalette.accent, -0.3), 0.06);
+      drawDisc(cx, cy, r, "#cdbfa6", 0.7);
+      const sky = mixHex(scenePalette.bgA, scenePalette.bgB, Math.min(1, cy / horizonY()));
+      drawDisc(cx + r * 0.5, cy - r * 0.3, r * 0.95, sky, 1);
+    }
+
+    function towerWindows(x0, y0, x1, y1, color) {
+      for (let wy = y0; wy < y1; wy += 3) {
+        for (let wx = x0; wx < x1; wx += 2) {
+          const lit = 0.5 + 0.5 * Math.sin(animClock * 1.3 + wx * 0.7 + wy * 1.3);
+          if (lit > 0.5) {
+            pctx.globalAlpha = Math.min(1, lit * 0.85);
+            rect(wx, wy, 1, 1, color);
+          }
+        }
+      }
+      pctx.globalAlpha = 1;
+    }
+
+    function drawCity() {
+      const horizon = horizonY();
+      const silhouette = shade(scenePalette.bgA, -0.5);
+      for (const b of buildings) {
+        rect(b.x, horizon - b.h, b.w, b.h, silhouette);
+        for (const win of b.windows) {
+          const lit = 0.45 + 0.55 * Math.sin(animClock * 1.4 + win.phase);
+          const value = win.base * lit;
+          if (value > 0.32) {
+            pctx.globalAlpha = Math.min(1, value);
+            rect(win.x, win.y, 1, 1, win.color);
+          }
+        }
+      }
+      pctx.globalAlpha = 1;
+      drawPearlTower(horizon, silhouette);
+      drawJinMao(horizon, silhouette, "#ffd27a");
+      drawWFC(horizon, silhouette, "#b98cff");
+      drawShanghaiTower(horizon, silhouette, "#86ffe0");
+    }
+
+    function drawPearlTower(horizon, silhouette) {
+      const x = Math.round(pw * 0.62);
+      const topY = horizon - Math.round(ph * 0.42);
+      rect(x, topY, 2, horizon - topY, silhouette);
+      rect(x - 3, horizon - 6, 1, 6, silhouette);
+      rect(x + 4, horizon - 6, 1, 6, silhouette);
+      drawDisc(x + 1, horizon - Math.round(ph * 0.16), Math.round(ph * 0.04), "#ff7fb0", 0.9);
+      drawDisc(x + 1, horizon - Math.round(ph * 0.28), Math.round(ph * 0.026), "#ff9ec6", 0.9);
+      pctx.globalAlpha = 0.6 + 0.4 * Math.sin(animClock * 2);
+      rect(x, topY - 2, 2, 2, shade(scenePalette.accent, 0.4));
+      pctx.globalAlpha = 1;
+    }
+
+    function drawJinMao(horizon, silhouette, winColor) {
+      const x = Math.round(pw * 0.7);
+      const totalH = Math.round(ph * 0.38);
+      const tiers = 6;
+      const tierH = Math.max(2, Math.floor(totalH / tiers));
+      let w = 8;
+      let y = horizon;
+      for (let t = 0; t < tiers; t += 1) {
+        const left = x - Math.floor(w / 2);
+        rect(left, y - tierH, w, tierH, silhouette);
+        towerWindows(left + 1, y - tierH + 1, left + w - 1, y - 1, winColor);
+        y -= tierH;
+        w = Math.max(2, w - 1);
+      }
+      const spireH = Math.round(ph * 0.05);
+      rect(x, y - spireH, 1, spireH, silhouette);
+      pctx.globalAlpha = 0.5 + 0.5 * Math.sin(animClock * 1.6 + 2);
+      rect(x, y - spireH - 1, 1, 2, shade(scenePalette.accent, 0.4));
+      pctx.globalAlpha = 1;
+    }
+
+    function drawWFC(horizon, silhouette, winColor) {
+      const x = Math.round(pw * 0.78);
+      const h = Math.round(ph * 0.41);
+      const wBot = 9;
+      const wTop = 4;
+      const top = horizon - h;
+      for (let i = 0; i < h; i += 1) {
+        const t = i / h;
+        const w = Math.round(wBot + (wTop - wBot) * t);
+        rect(x - Math.floor(w / 2), horizon - i, w, 1, silhouette);
+      }
+      towerWindows(x - 3, top + Math.round(h * 0.18), x + 3, horizon - 2, winColor);
+      const holeTop = top + 1;
+      const holeBottom = top + Math.round(h * 0.13);
+      for (let yy = holeTop; yy < holeBottom; yy += 1) {
+        const tt = (yy - holeTop) / Math.max(1, holeBottom - holeTop);
+        const ww = Math.max(1, Math.round(3 - tt * 2));
+        const skyc = mixHex(scenePalette.bgA, scenePalette.bgB, Math.min(1, yy / horizon));
+        rect(x - ww, yy, ww * 2, 1, skyc);
+      }
+      pctx.globalAlpha = 0.5 + 0.5 * Math.sin(animClock * 1.6 + 3);
+      rect(x - 1, top, 3, 1, shade(scenePalette.accent, 0.4));
+      pctx.globalAlpha = 1;
+    }
+
+    function drawShanghaiTower(horizon, silhouette, winColor) {
+      const x = Math.round(pw * 0.5);
+      const h = Math.round(ph * 0.56);
+      const baseHw = Math.max(4, Math.round(pw * 0.026));
+      const top = horizon - h;
+      const facade = shade(scenePalette.bgA, -0.45);
+      const seam = shade(scenePalette.accent, 0.05);
+
+      for (let i = 0; i < h; i += 1) {
+        const t = i / h;
+        let hw = baseHw * (1 - t * 0.62);
+        if (t > 0.92) hw *= 0.1 + (1 - (t - 0.92) / 0.08) * 0.9;
+        const lean = x + Math.round(t * t * -2);
+        const sweep = Math.sin(t * Math.PI) * baseHw * 0.7;
+        const left = lean - hw;
+        const right = lean + hw + sweep;
+        const y = horizon - i;
+        rect(left, y, Math.max(1, right - left), 1, silhouette);
+        rect(right - 1, y, 1, 1, facade);
+      }
+
+      pctx.globalAlpha = 0.45;
+      for (let i = 0; i < h; i += 2) {
+        const t = i / h;
+        const hw = baseHw * (1 - t * 0.62);
+        const lean = x + Math.round(t * t * -2);
+        const sweep = Math.sin(t * Math.PI) * baseHw * 0.7;
+        const frac = Math.sin(t * Math.PI * 2.6) * 0.5 + 0.5;
+        const sx = (lean - hw) + frac * (2 * hw + sweep);
+        rect(sx, horizon - i, 1, 1, seam);
+      }
+      pctx.globalAlpha = 1;
+
+      towerWindows(x - baseHw + 1, top + Math.round(h * 0.06), x + baseHw, horizon - 2, winColor);
+
+      pctx.globalAlpha = 0.5 + 0.5 * Math.sin(animClock * 1.6 + 1);
+      rect(x - 1, top, 2, 2, shade(scenePalette.accent, 0.45));
+      pctx.globalAlpha = 1;
+    }
+
+    function drawRiver() {
+      const riverTop = horizonY();
+      const riverBottom = Math.round(ph * 0.74);
+      rect(0, riverTop, pw, riverBottom - riverTop, shade(scenePalette.bgB, -0.4));
+      const streakColor = shade(scenePalette.accent, 0.05);
+      const xs = [pw * 0.4, pw * 0.5, pw * 0.62, pw * 0.7, pw * 0.78];
+      for (const sx of xs) {
+        for (let y = riverTop; y < riverBottom; y += 1) {
+          const wob = Math.sin(animClock * 2 + y * 0.6 + sx) * 1.2;
+          pctx.globalAlpha = 0.1 + 0.06 * Math.sin(animClock * 3 + sx);
+          rect(sx + wob, y, 1, 1, streakColor);
+        }
+      }
+      pctx.globalAlpha = 1;
+    }
+
+    function drawMountain() {
+      const plateauL = Math.round(pw * 0.05);
+      const plateauR = Math.round(pw * 0.3);
+      const peakY = Math.round(ph * 0.42);
+      const leftBaseY = Math.round(ph * 0.96);
+      const rightBaseX = Math.round(pw * 0.4);
+      const rightBaseY = Math.round(ph * 0.82);
+      const mtnColor = shade(scenePalette.bgA, -0.72);
+      const rim = shade(scenePalette.accent, -0.2);
+      const shift = Math.round(lookX * 4);
+      for (let x = 0; x <= rightBaseX; x += 1) {
+        let topY;
+        if (x <= plateauL) {
+          topY = Math.round(leftBaseY + (peakY - leftBaseY) * (x / plateauL));
+        } else if (x <= plateauR) {
+          topY = peakY;
+        } else {
+          topY = Math.round(peakY + (rightBaseY - peakY) * ((x - plateauR) / (rightBaseX - plateauR)));
+        }
+        rect(x + shift, topY, 1, ph - topY, mtnColor);
+        rect(x + shift, topY, 1, 1, rim);
+      }
+    }
+
+    function drawBlossomCluster(x, y) {
+      const f = hashFrac(Math.round(x), Math.round(y));
+      const r = 2 + Math.round(f * 2);
+      const sway = Math.sin(animClock * 0.7 + x * 0.2) * 0.8;
+      const cx = x + sway;
+      drawDisc(cx, y, r, blossomPinks[1], 0.95);
+      drawDisc(cx - r * 0.5, y + 1, r * 0.7, blossomPinks[0], 0.9);
+      drawDisc(cx + r * 0.5, y - 1, r * 0.6, blossomPinks[2], 0.9);
+      rect(cx, y - 1, 1, 1, "#ffe6f0");
+    }
+
+    function drawBranch(x0, y0, angle, length, depth, color) {
+      const x1 = x0 + Math.cos(angle) * length;
+      const y1 = y0 + Math.sin(angle) * length;
+      drawThickLine(x0, y0, x1, y1, Math.max(1, depth - 1), color);
+      if (depth <= 1 || length < 4) {
+        drawBlossomCluster(x1, y1);
+        return;
+      }
+      const spread = 0.4 + hashFrac(Math.round(x1), Math.round(y1)) * 0.3;
+      drawBranch(x1, y1, angle - spread, length * 0.72, depth - 1, color);
+      drawBranch(x1, y1, angle + spread, length * 0.7, depth - 1, color);
+      if (depth > 2) {
+        drawBranch(x1, y1, angle + (hashFrac(x1, y1) - 0.5) * 0.4, length * 0.6, depth - 1, color);
+        drawBlossomCluster((x0 + x1) / 2, (y0 + y1) / 2);
+      }
+    }
+
+    function drawTree() {
+      const shift = Math.round(lookX * 4);
+      const baseX = Math.round(pw * 0.18) + shift;
+      const groundY = Math.round(ph * 0.42);
+      const trunkColor = "#4a2c20";
+      const branchColor = "#5e3a2a";
+      const trunkH = Math.round(ph * 0.2);
+      const topX = baseX - 2;
+      const topY = groundY - trunkH;
+      const trunkThick = Math.max(3, Math.round(pw * 0.013));
+
+      drawThickLine(baseX, groundY, topX, topY, trunkThick, trunkColor);
+      drawBranch(baseX - 1, groundY - Math.round(trunkH * 0.55), -Math.PI / 2 - 1.05, Math.round(ph * 0.085), 3, branchColor);
+      drawBranch(baseX + 1, groundY - Math.round(trunkH * 0.45), -Math.PI / 2 + 1, Math.round(ph * 0.08), 3, branchColor);
+
+      const len = Math.round(ph * 0.1);
+      drawBranch(topX, topY, -Math.PI / 2 - 0.55, len, 4, branchColor);
+      drawBranch(topX, topY, -Math.PI / 2 - 0.05, len * 1.1, 4, branchColor);
+      drawBranch(topX, topY, -Math.PI / 2 + 0.5, len, 4, branchColor);
+    }
+
+    function drawSeated(cx, groundY, h, body, rim, type) {
+      const torsoH = Math.round(h * 0.42);
+      const backLean = Math.round(h * 0.1);
+      const shoulderX = cx - backLean;
+      const shoulderY = groundY - torsoH;
+      const headR = Math.max(2, Math.round(h * (type === "woman" ? 0.1 : 0.115)));
+      const limb = Math.max(2, Math.round(h * 0.1));
+      const torsoW = Math.max(3, Math.round(h * 0.15));
+
+      const kneeX = cx + Math.round(h * 0.24);
+      const kneeY = groundY - Math.round(h * 0.22);
+      const footX = cx + Math.round(h * 0.34);
+
+      // bent legs reaching toward the city on the right
+      drawThickLine(cx, groundY, kneeX, kneeY, limb, body);
+      drawThickLine(kneeX, kneeY, footX, groundY, limb, body);
+      // torso leaning back
+      drawThickLine(cx, groundY, shoulderX, shoulderY, torsoW, body);
+      // arm resting on the knee
+      drawThickLine(shoulderX, shoulderY + 1, kneeX, kneeY, Math.max(2, limb - 1), body);
+      // head facing the skyline
+      const headCx = shoulderX + Math.round(headR * 0.3);
+      const headCy = shoulderY - headR + 1;
+      drawDisc(headCx, headCy, headR, body, 1);
+
+      if (type === "woman") {
+        const hairTopY = headCy - headR;
+        const hairBotY = shoulderY + Math.round(torsoH * 0.6);
+        for (let y = hairTopY; y <= hairBotY; y += 1) {
+          const t = (y - hairTopY) / Math.max(1, hairBotY - hairTopY);
+          const hx = headCx - headR - Math.round(t * 1.5);
+          rect(hx, y, Math.max(2, Math.round(headR * 0.8)), 1, body);
+        }
+      }
+
+      // rim light along the back so they read against the night
+      pctx.globalAlpha = 0.55;
+      drawThickLine(shoulderX - Math.round(torsoW / 2), shoulderY, cx - Math.round(torsoW / 2), groundY, 1, rim);
+      rect(headCx - headR, headCy - 1, 1, 2, rim);
+      pctx.globalAlpha = 1;
+    }
+
+    function drawCouple() {
+      const groundY = Math.round(ph * 0.42);
+      const shift = Math.round(lookX * 4);
+      const body = "#080610";
+      const rim = shade(scenePalette.accent, 0.2);
+      const h = Math.max(16, Math.round(ph * 0.2));
+      drawSeated(Math.round(pw * 0.205) + shift, groundY, h, body, rim, "man");
+      drawSeated(Math.round(pw * 0.24) + shift, groundY, h, body, rim, "woman");
+    }
+
+    function updatePetals(dt) {
+      const wind = 3 + Math.sin(animClock * 0.3) * 5;
+      for (const p of petals) {
+        p.sway += p.swaySpeed * dt;
+        p.y += p.vy * dt;
+        p.x += (p.vx + wind + Math.sin(p.sway) * p.swayAmp) * dt;
+        if (p.y > ph + 3 || p.x > pw + 4 || p.x < -4) {
+          Object.assign(p, spawnPetal(false));
+          p.x = Math.random() * pw * 0.55 - 4;
+          p.y = Math.random() * ph * 0.5 - 3;
+        }
+      }
+    }
+
+    function drawPetals() {
+      for (const p of petals) {
+        const c = blossomPinks[p.tint];
+        drawDisc(p.x, p.y, p.size, c, 0.92);
+        rect(p.x, p.y - Math.round(p.size), 1, 1, "#fff2f7");
+      }
+    }
+
+    function spawnShootingStar() {
+      const fromLeft = Math.random() < 0.5;
+      const dir = fromLeft ? 1 : -1;
+      const speed = pw * (0.5 + Math.random() * 0.4);
+      const angle = Math.PI / 7 + Math.random() * (Math.PI / 7);
+      return {
+        x: fromLeft ? pw * (Math.random() * 0.4) : pw * (0.6 + Math.random() * 0.4),
+        y: ph * (0.04 + Math.random() * 0.2),
+        vx: dir * speed * Math.cos(angle),
+        vy: speed * Math.sin(angle),
+        life: 1,
+        trail: []
+      };
+    }
+
+    function updateShootingStars(dt) {
+      nextStarTime -= dt;
+      if (nextStarTime <= 0 && shootingStars.length < 1) {
+        shootingStars.push(spawnShootingStar());
+        nextStarTime = 5 + Math.random() * 9;
+      }
+      for (const s of shootingStars) {
+        if (s.life > 0) {
+          s.x += s.vx * dt;
+          s.y += s.vy * dt;
+          s.trail.push({ x: s.x, y: s.y, life: 1 });
+          if (s.x < -4 || s.x > pw + 4 || s.y > ph * 0.66) s.life = 0;
+        }
+        s.life -= dt * 0.5;
+        for (const t of s.trail) t.life -= dt * 2.2;
+        while (s.trail.length && s.trail[0].life <= 0) s.trail.shift();
+      }
+      shootingStars = shootingStars.filter((s) => s.life > 0 || s.trail.length > 0);
+    }
+
+    function drawShootingStars() {
+      for (const s of shootingStars) {
+        for (const t of s.trail) {
+          pctx.globalAlpha = Math.max(0, t.life) * 0.7;
+          rect(t.x, t.y, 1, 1, "#dff0ff");
+        }
+        pctx.globalAlpha = 1;
+        if (s.life > 0) {
+          pctx.globalAlpha = Math.min(1, s.life * 1.6);
+          rect(s.x, s.y, 2, 2, "#ffffff");
+          rect(s.x - 1, s.y, 1, 1, "#bfe0ff");
+          pctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    function drawPixelScene() {
+      if (!pw || !ph) return;
+      pctx.clearRect(0, 0, pw, ph);
+      drawSky();
+      drawCelestial();
+      drawStars();
+      drawShootingStars();
+      drawCity();
+      drawRiver();
+      drawMountain();
+      drawTree();
+      drawCouple();
+      drawPetals();
+    }
+
+    const frameInterval = 1000 / 30;
+
+    function renderPixelFrame(ts) {
+      rafId = requestAnimationFrame(renderPixelFrame);
+      if (lastTs && ts - lastTs < frameInterval) return;
+      const dt = lastTs ? Math.min(0.05, (ts - lastTs) / 1000) : 0.016;
+      lastTs = ts;
+      animClock += dt;
+      updatePetals(dt);
+      updateShootingStars(dt);
+      drawPixelScene();
+    }
+
+    function startPixelLoop() {
+      if (prefersReducedMotion) {
+        drawPixelScene();
+        return;
+      }
+      if (rafId) return;
+      lastTs = 0;
+      rafId = requestAnimationFrame(renderPixelFrame);
+    }
+
+    function stopPixelLoop() {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    }
+
+    // ===== Curtains =====
+    let curtainsOpen = false;
+
+    function openCurtains() {
+      if (curtainsOpen) return;
+      curtainsOpen = true;
+      curtains.classList.add("is-open");
+      startAudio();
+    }
+
+    function updateLookVector(clientX, clientY) {
+      lookX = (clientX / window.innerWidth) * 2 - 1;
+      lookY = (clientY / window.innerHeight) * 2 - 1;
+    }
+
+    function resetLookVector() {
+      lookX = 0;
+      lookY = 0;
+    }
+
+    curtainOpen.addEventListener("click", openCurtains);
+
+    audioToggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleMute();
+    });
+
+    window.addEventListener("mousemove", (event) => {
+      updateLookVector(event.clientX, event.clientY);
+    });
+
+    window.addEventListener("touchmove", (event) => {
+      if (event.touches.length === 0) return;
+      const touch = event.touches[0];
+      updateLookVector(touch.clientX, touch.clientY);
+    }, { passive: true });
+
+    window.addEventListener("touchend", resetLookVector);
+    window.addEventListener("mouseleave", resetLookVector);
+    window.addEventListener("blur", resetLookVector);
+
+    window.addEventListener("resize", () => {
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        setupPixelScene();
+        if (prefersReducedMotion) drawPixelScene();
+      });
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopPixelLoop();
+        if (usingFile) {
+          if (musicEl) musicEl.pause();
+        } else {
+          stopScheduler();
+          if (audioCtx && audioCtx.state === "running") audioCtx.suspend();
+        }
+      } else {
+        startPixelLoop();
+        if (usingFile) {
+          if (musicEl && !isMuted) musicEl.play().catch(() => {});
+        } else if (synthReady) {
+          if (!isMuted && audioCtx.state === "suspended") audioCtx.resume();
+          nextNoteTime = audioCtx.currentTime + 0.2;
+          startScheduler();
+        }
+      }
+    });
+
+    setupMusic();
+    setupPixelScene();
+    startPixelLoop();
+  </script>
+</body>
+</html>
