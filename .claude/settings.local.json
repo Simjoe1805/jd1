@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell($n = Get-Command node -ErrorAction SilentlyContinue; if \\($n\\) { \"node: $\\($n.Source\\)\" } else { \"node: NOT FOUND\" })"
+      "PowerShell($n = Get-Command node -ErrorAction SilentlyContinue; if \\($n\\) { \"node: $\\($n.Source\\)\" } else { \"node: NOT FOUND\" })",
+      "WebFetch(domain:simjoe1805.github.io)"
     ]
   }
 }
